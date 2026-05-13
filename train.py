@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -33,6 +34,7 @@ def parse_args():
     parser.add_argument("--trainable-backbone-layers", type=int, default=None, help="Fine-tuned backbone layers.")
     parser.add_argument("--min-size", type=int, default=None, help="Detector input min size.")
     parser.add_argument("--max-size", type=int, default=None, help="Detector input max size.")
+    parser.add_argument("--eval-map-every", type=int, default=None, help="Evaluate mAP50 every N epochs.")
     parser.add_argument("--device", default=None, help="cuda, cpu, or leave empty for auto.")
     return parser.parse_args()
 
@@ -62,7 +64,96 @@ def apply_cli_overrides(cfg: dict, args) -> dict:
         cfg["model"]["min_size"] = args.min_size
     if args.max_size is not None:
         cfg["model"]["max_size"] = args.max_size
+    if args.eval_map_every is not None:
+        cfg["train"]["eval_map_every"] = args.eval_map_every
     return cfg
+
+
+def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return torch.zeros((boxes1.shape[0], boxes2.shape[0]), dtype=torch.float32)
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    union = area1[:, None] + area2 - inter
+    return inter / union.clamp(min=1e-6)
+
+
+def ap_from_pr(tp: list[int], fp: list[int], total_gt: int) -> float:
+    if total_gt == 0:
+        return float("nan")
+    tp_cum = torch.tensor(tp, dtype=torch.float32).cumsum(0)
+    fp_cum = torch.tensor(fp, dtype=torch.float32).cumsum(0)
+    recalls = tp_cum / max(1, total_gt)
+    precisions = tp_cum / torch.clamp(tp_cum + fp_cum, min=1e-6)
+
+    recalls = torch.cat([torch.tensor([0.0]), recalls, torch.tensor([1.0])])
+    precisions = torch.cat([torch.tensor([0.0]), precisions, torch.tensor([0.0])])
+    for index in range(precisions.numel() - 2, -1, -1):
+        precisions[index] = torch.maximum(precisions[index], precisions[index + 1])
+    changed = torch.where(recalls[1:] != recalls[:-1])[0]
+    return float(torch.sum((recalls[changed + 1] - recalls[changed]) * precisions[changed + 1]).item())
+
+
+def evaluate_map50(model, loader, device, num_classes: int, max_detections: int = 300) -> float:
+    model.eval()
+    gt_by_class: dict[int, dict[int, torch.Tensor]] = defaultdict(dict)
+    total_gt_by_class: dict[int, int] = defaultdict(int)
+    predictions_by_class: dict[int, list[tuple[float, int, torch.Tensor]]] = defaultdict(list)
+    image_index = 0
+
+    with torch.no_grad():
+        for images, targets in tqdm(loader, desc="Val mAP50", leave=False):
+            images = [img.to(device) for img in images]
+            outputs = model(images)
+            for target, output in zip(targets, outputs):
+                gt_boxes = target["boxes"].cpu()
+                gt_labels = target["labels"].cpu()
+                for class_idx in range(1, num_classes):
+                    class_boxes = gt_boxes[gt_labels == class_idx]
+                    gt_by_class[class_idx][image_index] = class_boxes
+                    total_gt_by_class[class_idx] += int(class_boxes.shape[0])
+
+                pred_boxes = output["boxes"][:max_detections].detach().cpu()
+                pred_labels = output["labels"][:max_detections].detach().cpu()
+                pred_scores = output["scores"][:max_detections].detach().cpu()
+                for box, label, score in zip(pred_boxes, pred_labels, pred_scores):
+                    predictions_by_class[int(label.item())].append((float(score.item()), image_index, box))
+                image_index += 1
+
+    ap_values: list[float] = []
+    for class_idx in range(1, num_classes):
+        pred_items = predictions_by_class[class_idx]
+        pred_items.sort(key=lambda item: item[0], reverse=True)
+        matched: dict[int, set[int]] = defaultdict(set)
+        tp: list[int] = []
+        fp: list[int] = []
+        for _, pred_image_index, pred_box in pred_items:
+            gt_boxes = gt_by_class[class_idx].get(pred_image_index, torch.empty((0, 4)))
+            if gt_boxes.numel() == 0:
+                tp.append(0)
+                fp.append(1)
+                continue
+            ious = box_iou(pred_box.unsqueeze(0), gt_boxes).squeeze(0)
+            best_iou, best_gt = torch.max(ious, dim=0)
+            gt_index = int(best_gt.item())
+            if float(best_iou.item()) >= 0.5 and gt_index not in matched[pred_image_index]:
+                matched[pred_image_index].add(gt_index)
+                tp.append(1)
+                fp.append(0)
+            else:
+                tp.append(0)
+                fp.append(1)
+
+        ap = ap_from_pr(tp, fp, total_gt_by_class[class_idx])
+        if not torch.isnan(torch.tensor(ap)):
+            ap_values.append(ap)
+
+    model.train()
+    return sum(ap_values) / max(1, len(ap_values)) * 100.0
 
 
 def evaluate_loss(model, loader, device):
@@ -149,8 +240,10 @@ def main():
         start_epoch = int(checkpoint["epoch"]) + 1
 
     best_val = float("inf")
+    best_map50 = 0.0
     epochs = int(train_cfg.get("epochs", 20))
     print_freq = int(train_cfg.get("print_freq", 50))
+    eval_map_every = int(train_cfg.get("eval_map_every", 0) or 0)
     for epoch in range(start_epoch, epochs):
         model.train()
         epoch_loss = 0.0
@@ -192,6 +285,13 @@ def main():
         if val_records and val_loss < best_val:
             best_val = val_loss
             torch.save(checkpoint, output_dir / "best.pth")
+        if val_records and eval_map_every > 0 and (epoch + 1) % eval_map_every == 0:
+            map50 = evaluate_map50(model, val_loader, device, num_classes=len(classes) + 1)
+            print(f"Epoch {epoch + 1}: val_mAP50={map50:.2f}")
+            checkpoint["val_map50"] = map50
+            if map50 > best_map50:
+                best_map50 = map50
+                torch.save(checkpoint, output_dir / "best_map50.pth")
 
     print(f"Done. Checkpoints saved to: {output_dir}")
 

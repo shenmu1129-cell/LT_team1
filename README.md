@@ -126,6 +126,7 @@ lr=0.003
 trainable_backbone_layers=5
 min_size=1024
 max_size=1600
+eval_map_every=10
 output_dir=outputs/tt100k_frcnn_ep50_bs4_lr003
 ```
 
@@ -261,6 +262,7 @@ Source Model, Target Detector, Clean mAP50, Adv mAP50, Clean Recall, Adv Recall,
 ## 说明
 
 - `train.py` 保存 `last.pth` 和验证损失最小的 `best.pth`。
+- 后台训练脚本会每 10 轮输出一次验证集 `val_mAP50`，并保存 mAP50 最高的 `best_map50.pth`。
 - `classes.json` 保存类别顺序，预测时必须和 checkpoint 一起使用。
 - 显存不够时，优先把 `batch_size` 改为 `1`。
 - 你当前 TT100K 标注里类别编号是 `0` 到 `44`，配置中已经固定为 45 类类别名。Faster R-CNN 训练时会自动额外加入背景类。
