@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -35,6 +36,7 @@ def parse_args():
     parser.add_argument("--min-size", type=int, default=None, help="Detector input min size.")
     parser.add_argument("--max-size", type=int, default=None, help="Detector input max size.")
     parser.add_argument("--eval-map-every", type=int, default=None, help="Evaluate mAP50 every N epochs.")
+    parser.add_argument("--quick-eval-samples", type=int, default=None, help="Evaluate this many val samples after every epoch.")
     parser.add_argument("--device", default=None, help="cuda, cpu, or leave empty for auto.")
     return parser.parse_args()
 
@@ -66,6 +68,8 @@ def apply_cli_overrides(cfg: dict, args) -> dict:
         cfg["model"]["max_size"] = args.max_size
     if args.eval_map_every is not None:
         cfg["train"]["eval_map_every"] = args.eval_map_every
+    if args.quick_eval_samples is not None:
+        cfg["train"]["quick_eval_samples"] = args.quick_eval_samples
     return cfg
 
 
@@ -98,20 +102,25 @@ def ap_from_pr(tp: list[int], fp: list[int], total_gt: int) -> float:
     return float(torch.sum((recalls[changed + 1] - recalls[changed]) * precisions[changed + 1]).item())
 
 
-def evaluate_map50(model, loader, device, num_classes: int, max_detections: int = 300) -> float:
+def evaluate_detection_metrics(
+    model, loader, device, num_classes: int, max_detections: int = 300, score_threshold: float = 0.05
+) -> dict[str, float]:
     model.eval()
     gt_by_class: dict[int, dict[int, torch.Tensor]] = defaultdict(dict)
     total_gt_by_class: dict[int, int] = defaultdict(int)
     predictions_by_class: dict[int, list[tuple[float, int, torch.Tensor]]] = defaultdict(list)
+    detected_gt: set[tuple[int, int]] = set()
+    total_gt = 0
     image_index = 0
 
     with torch.no_grad():
-        for images, targets in tqdm(loader, desc="Val mAP50", leave=False):
+        for images, targets in tqdm(loader, desc="Val metrics", leave=False):
             images = [img.to(device) for img in images]
             outputs = model(images)
             for target, output in zip(targets, outputs):
                 gt_boxes = target["boxes"].cpu()
                 gt_labels = target["labels"].cpu()
+                total_gt += int(gt_boxes.shape[0])
                 for class_idx in range(1, num_classes):
                     class_boxes = gt_boxes[gt_labels == class_idx]
                     gt_by_class[class_idx][image_index] = class_boxes
@@ -122,6 +131,17 @@ def evaluate_map50(model, loader, device, num_classes: int, max_detections: int 
                 pred_scores = output["scores"][:max_detections].detach().cpu()
                 for box, label, score in zip(pred_boxes, pred_labels, pred_scores):
                     predictions_by_class[int(label.item())].append((float(score.item()), image_index, box))
+
+                recall_keep = pred_scores >= score_threshold
+                recall_boxes = pred_boxes[recall_keep]
+                recall_labels = pred_labels[recall_keep]
+                for gt_index, (gt_box, gt_label) in enumerate(zip(gt_boxes, gt_labels)):
+                    same_class = recall_labels == gt_label
+                    if same_class.sum() == 0:
+                        continue
+                    ious = box_iou(gt_box.unsqueeze(0), recall_boxes[same_class]).squeeze(0)
+                    if ious.numel() and float(ious.max().item()) >= 0.5:
+                        detected_gt.add((image_index, gt_index))
                 image_index += 1
 
     ap_values: list[float] = []
@@ -153,7 +173,24 @@ def evaluate_map50(model, loader, device, num_classes: int, max_detections: int 
             ap_values.append(ap)
 
     model.train()
-    return sum(ap_values) / max(1, len(ap_values)) * 100.0
+    return {
+        "map50": sum(ap_values) / max(1, len(ap_values)) * 100.0,
+        "recall": len(detected_gt) / max(1, total_gt) * 100.0,
+        "gt_boxes": float(total_gt),
+    }
+
+
+def evaluate_map50(model, loader, device, num_classes: int, max_detections: int = 300) -> float:
+    return evaluate_detection_metrics(model, loader, device, num_classes, max_detections)["map50"]
+
+
+def append_quick_eval_csv(path: Path, row: dict[str, float]) -> None:
+    exists = path.exists()
+    with path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def evaluate_loss(model, loader, device):
@@ -216,6 +253,20 @@ def main():
         collate_fn=collate_fn,
         pin_memory=device.type == "cuda",
     )
+    quick_eval_samples = int(train_cfg.get("quick_eval_samples", 0) or 0)
+    quick_loader = None
+    if quick_eval_samples > 0 and val_records:
+        quick_records = val_records[:quick_eval_samples]
+        quick_dataset = TrafficSignDetectionDataset(quick_records, class_to_idx, train=False)
+        quick_loader = DataLoader(
+            quick_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=int(train_cfg.get("num_workers", 4)),
+            collate_fn=collate_fn,
+            pin_memory=device.type == "cuda",
+        )
+        print(f"Quick eval samples: {len(quick_records)}")
 
     model = build_faster_rcnn(num_classes=len(classes) + 1, cfg=cfg).to(device)
     optimizer = torch.optim.SGD(
@@ -285,6 +336,25 @@ def main():
         if val_records and val_loss < best_val:
             best_val = val_loss
             torch.save(checkpoint, output_dir / "best.pth")
+        if quick_loader is not None:
+            quick_metrics = evaluate_detection_metrics(
+                model, quick_loader, device, num_classes=len(classes) + 1, score_threshold=0.05
+            )
+            print(
+                f"Epoch {epoch + 1}: quick_mAP50={quick_metrics['map50']:.2f}, "
+                f"quick_recall={quick_metrics['recall']:.2f}, quick_gt={int(quick_metrics['gt_boxes'])}"
+            )
+            append_quick_eval_csv(
+                output_dir / "quick_eval.csv",
+                {
+                    "epoch": epoch + 1,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "quick_map50": quick_metrics["map50"],
+                    "quick_recall": quick_metrics["recall"],
+                    "lr": optimizer.param_groups[0]["lr"],
+                },
+            )
         if val_records and eval_map_every > 0 and (epoch + 1) % eval_map_every == 0:
             map50 = evaluate_map50(model, val_loader, device, num_classes=len(classes) + 1)
             print(f"Epoch {epoch + 1}: val_mAP50={map50:.2f}")

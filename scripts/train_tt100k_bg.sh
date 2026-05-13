@@ -29,6 +29,7 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" nohup python -u train.py \
   --min-size 1024 \
   --max-size 1600 \
   --eval-map-every 10 \
+  --quick-eval-samples 100 \
   > "${LOG_FILE}" 2>&1 &
 
 PID=$!
