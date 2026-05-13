@@ -45,29 +45,32 @@ class_id x_center y_center width height
 
 ### CCTSDB
 
-建议目录：
+如果你的 CCTSDB 是目录式 YOLO 格式，目录类似：
 
 ```text
 CCTSDB/
   images/
-    *.jpg
-  annotations/
-    *.xml
+    train/
+      *.jpg
+    test/
+      *.jpg
+    test_fgsm_v9/
+      *.jpg
+  labels/
+    train/
+      *.txt
+    test/
+      *.txt
+    test_fgsm_v9/
+      *.txt
 ```
 
 你至少需要：
 
-- 图片目录，如 `images/`
-- VOC XML 标注目录，如 `annotations/`
+- `images/train` 和 `labels/train`
+- `images/test` 和 `labels/test`
 
-如果你有官方划分文件，也可以在 `configs/cctsdb.yaml` 里填：
-
-```yaml
-train_split_file: ImageSets/Main/train.txt
-val_split_file: ImageSets/Main/val.txt
-```
-
-没有划分文件时，代码会自动按 `val_ratio` 从 XML 中划分训练集和验证集。
+代码会自动把 YOLO 归一化框转换成 Faster R-CNN 需要的像素框。`images/test_fgsm_v9` 可以作为对抗样本目录，用 `evaluate.py --adv-root` 评估。
 
 ## 安装
 
@@ -181,9 +184,12 @@ python tools/check_yolo_dataset.py --root /home/sutongtong/LanTu_team1/TT100K-20
 
 ```yaml
 dataset:
+  name: cctsdb_yolo
   root: /absolute/path/to/CCTSDB
   image_dir: images
-  annotation_dir: annotations
+  label_dir: labels
+  train_split: train
+  val_split: test
 ```
 
 然后运行：
@@ -191,6 +197,17 @@ dataset:
 ```bash
 python train.py --config configs/cctsdb.yaml
 ```
+
+如果 CCTSDB 的类别名还不确定，配置里的 `classes: null` 会自动使用标签中的数字类别，例如 `0`、`1`、`2`。如果你有类别名，建议改成：
+
+```yaml
+classes:
+  - mandatory
+  - prohibitory
+  - warning
+```
+
+实际顺序必须和你的 YOLO 标签 id 一致。
 
 ## 指定类别
 

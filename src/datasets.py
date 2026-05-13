@@ -11,7 +11,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.transforms import functional as F
 
-from .utils import find_image_by_stem, load_json
+from .utils import IMAGE_EXTENSIONS, find_image_by_stem, load_json
 
 
 @dataclass
@@ -118,6 +118,14 @@ def _yolo_label_path(root: Path, image_path: Path) -> Path:
     return image_path.with_suffix(".txt")
 
 
+def _configured_yolo_label_path(root: Path, image_root: Path, label_root: Path, image_path: Path) -> Path:
+    try:
+        rel = image_path.relative_to(image_root)
+    except ValueError:
+        return _yolo_label_path(root, image_path)
+    return (label_root / rel).with_suffix(".txt")
+
+
 def _yolo_to_xyxy(values: list[float], width: int, height: int) -> list[float]:
     x_center, y_center, box_width, box_height = values
     x1 = (x_center - box_width / 2.0) * width
@@ -132,11 +140,45 @@ def _yolo_to_xyxy(values: list[float], width: int, height: int) -> list[float]:
     ]
 
 
-def load_yolo_records(cfg: dict, split: str) -> list[DetectionRecord]:
-    root = Path(cfg["root"]).expanduser()
-    split_file = root / cfg.get(f"{split}_file", f"{split}.txt")
+def _yolo_aliases(cfg: dict) -> dict[str, str]:
     aliases = {str(index): str(name) for index, name in enumerate(cfg.get("classes") or [])}
     aliases.update(cfg.get("class_aliases") or {})
+    return aliases
+
+
+def _read_yolo_record(image_path: Path, label_path: Path, aliases: dict[str, str], skip_empty: bool) -> DetectionRecord | None:
+    if not image_path.exists():
+        return None
+
+    boxes: list[list[float]] = []
+    labels: list[str] = []
+    if label_path.exists():
+        with Image.open(image_path) as image:
+            width, height = image.size
+        with label_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 5:
+                    continue
+                label = _normalize_label(parts[0], aliases)
+                try:
+                    box = _yolo_to_xyxy([float(v) for v in parts[1:5]], width, height)
+                except ValueError:
+                    continue
+                if not _valid_box(box):
+                    continue
+                boxes.append(box)
+                labels.append(label)
+
+    if boxes or not skip_empty:
+        return DetectionRecord(image_path=image_path, boxes=boxes, labels=labels)
+    return None
+
+
+def load_yolo_file_records(cfg: dict, split: str) -> list[DetectionRecord]:
+    root = Path(cfg["root"]).expanduser()
+    split_file = root / cfg.get(f"{split}_file", f"{split}.txt")
+    aliases = _yolo_aliases(cfg)
     skip_empty = bool(cfg.get("skip_empty", True))
 
     records: list[DetectionRecord] = []
@@ -144,34 +186,45 @@ def load_yolo_records(cfg: dict, split: str) -> list[DetectionRecord]:
         image_paths = [_resolve_path(root, line.split()[0]) for line in f if line.strip()]
 
     for image_path in image_paths:
-        if not image_path.exists():
-            continue
-
         label_path = _yolo_label_path(root, image_path)
-        boxes: list[list[float]] = []
-        labels: list[str] = []
-        if label_path.exists():
-            with Image.open(image_path) as image:
-                width, height = image.size
-            with label_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) < 5:
-                        continue
-                    label = _normalize_label(parts[0], aliases)
-                    try:
-                        box = _yolo_to_xyxy([float(v) for v in parts[1:5]], width, height)
-                    except ValueError:
-                        continue
-                    if not _valid_box(box):
-                        continue
-                    boxes.append(box)
-                    labels.append(label)
-
-        if boxes or not skip_empty:
-            records.append(DetectionRecord(image_path=image_path, boxes=boxes, labels=labels))
+        record = _read_yolo_record(image_path, label_path, aliases, skip_empty)
+        if record is not None:
+            records.append(record)
 
     return records
+
+
+def load_yolo_dir_records(cfg: dict, split: str) -> list[DetectionRecord]:
+    root = Path(cfg["root"]).expanduser()
+    split_name = cfg.get(f"{split}_split", "test" if split == "val" else split)
+    image_root = root / cfg.get("image_dir", "images")
+    label_root = root / cfg.get("label_dir", "labels")
+    image_dir = image_root / split_name
+    label_dir = label_root / split_name
+    if not image_dir.exists():
+        alt_image_dir = root / split_name / "images"
+        alt_label_dir = root / split_name / "labels"
+        if alt_image_dir.exists():
+            image_dir = alt_image_dir
+            label_dir = alt_label_dir
+    aliases = _yolo_aliases(cfg)
+    skip_empty = bool(cfg.get("skip_empty", True))
+
+    image_paths = sorted(path for path in image_dir.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS)
+    records: list[DetectionRecord] = []
+    for image_path in image_paths:
+        label_path = _configured_yolo_label_path(root, image_dir, label_dir, image_path)
+        record = _read_yolo_record(image_path, label_path, aliases, skip_empty)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def load_yolo_records(cfg: dict, split: str) -> list[DetectionRecord]:
+    root = Path(cfg["root"]).expanduser()
+    if (root / cfg.get(f"{split}_file", f"{split}.txt")).exists():
+        return load_yolo_file_records(cfg, split)
+    return load_yolo_dir_records(cfg, split)
 
 
 def _read_split_file(path: Path | None) -> set[str] | None:
@@ -286,7 +339,7 @@ def build_records(cfg: dict, split: str) -> list[DetectionRecord]:
     if name == "tt100k":
         split_key = f"{split}_splits"
         return load_tt100k_records(dataset_cfg, dataset_cfg.get(split_key, [split]))
-    if name in {"tt100k_yolo", "yolo"}:
+    if name in {"tt100k_yolo", "cctsdb_yolo", "yolo"}:
         return load_yolo_records(dataset_cfg, split)
     if name == "cctsdb":
         return load_cctsdb_records(dataset_cfg, split)

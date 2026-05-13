@@ -1,19 +1,17 @@
 dataset:
-  name: cctsdb
+  name: cctsdb_yolo
   root: /path/to/CCTSDB
   image_dir: images
-  annotation_dir: annotations
-  train_split_file: null
-  val_split_file: null
-  val_ratio: 0.2
-  classes: null
-  class_aliases:
-    Mandatory: mandatory
-    Prohibitory: prohibitory
-    Warning: warning
-    mandatory: mandatory
-    prohibitory: prohibitory
-    warning: warning
+  label_dir: labels
+  train_split: train
+  val_split: test
+  adv_split: test_fgsm_v9
+  skip_empty: true
+  classes:
+    - mandatory
+    - prohibitory
+    - warning
+  class_aliases: {}
 
 model:
   weights: DEFAULT
