@@ -27,6 +27,12 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=None, help="Override training batch size.")
     parser.add_argument("--num-workers", type=int, default=None, help="Override dataloader workers.")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate.")
+    parser.add_argument("--lr-step-size", type=int, default=None, help="Override StepLR step size.")
+    parser.add_argument("--lr-gamma", type=float, default=None, help="Override StepLR gamma.")
+    parser.add_argument("--weight-decay", type=float, default=None, help="Override weight decay.")
+    parser.add_argument("--trainable-backbone-layers", type=int, default=None, help="Fine-tuned backbone layers.")
+    parser.add_argument("--min-size", type=int, default=None, help="Detector input min size.")
+    parser.add_argument("--max-size", type=int, default=None, help="Detector input max size.")
     parser.add_argument("--device", default=None, help="cuda, cpu, or leave empty for auto.")
     return parser.parse_args()
 
@@ -44,6 +50,18 @@ def apply_cli_overrides(cfg: dict, args) -> dict:
         cfg["train"]["num_workers"] = args.num_workers
     if args.lr is not None:
         cfg["train"]["lr"] = args.lr
+    if args.lr_step_size is not None:
+        cfg["train"]["lr_step_size"] = args.lr_step_size
+    if args.lr_gamma is not None:
+        cfg["train"]["lr_gamma"] = args.lr_gamma
+    if args.weight_decay is not None:
+        cfg["train"]["weight_decay"] = args.weight_decay
+    if args.trainable_backbone_layers is not None:
+        cfg["model"]["trainable_backbone_layers"] = args.trainable_backbone_layers
+    if args.min_size is not None:
+        cfg["model"]["min_size"] = args.min_size
+    if args.max_size is not None:
+        cfg["model"]["max_size"] = args.max_size
     return cfg
 
 

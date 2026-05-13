@@ -109,6 +109,47 @@ python train.py \
   --batch-size 1
 ```
 
+### 后台训练脚本
+
+可以直接用脚本在指定显卡后台训练：
+
+```bash
+GPU_ID=2 bash scripts/train_tt100k_bg.sh
+```
+
+默认配置：
+
+```text
+epochs=50
+batch_size=4
+lr=0.003
+trainable_backbone_layers=5
+min_size=1024
+max_size=1600
+output_dir=outputs/tt100k_frcnn_ep50_bs4_lr003
+```
+
+查看日志：
+
+```bash
+tail -f logs/tt100k_frcnn_ep50_bs4_lr003.log
+```
+
+停止训练：
+
+```bash
+kill $(cat outputs/tt100k_frcnn_ep50_bs4_lr003/train.pid)
+```
+
+如果想改数据集路径、实验名或显卡号：
+
+```bash
+GPU_ID=3 \
+DATA_ROOT=/home/sutongtong/LanTu_team1/TT100K-2016 \
+EXP_NAME=tt100k_frcnn_ep50_gpu3 \
+bash scripts/train_tt100k_bg.sh
+```
+
 底层配置等价于：
 
 ```yaml
