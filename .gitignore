@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+*.conda/
+
+# Training artifacts
+outputs/
+runs/
+wandb/
+*.pth
+*.pt
+*.onnx
+*.engine
+
+# Datasets and large local files
+TT100K*/
+CCTSDB*/
+data/
+datasets/
+*.cache
+*.cache.npy
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
