@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-detections", type=int, default=300)
+    parser.add_argument("--max-samples", type=int, default=None, help="Evaluate only the first N clean samples.")
     parser.add_argument("--output-csv", default="outputs/eval_metrics.csv")
     parser.add_argument("--device", default=None)
     return parser.parse_args()
@@ -169,19 +170,23 @@ def find_adv_images(adv_root: Path) -> dict[str, Path]:
     return paths
 
 
-def records_with_adv_images(clean_records: list[DetectionRecord], adv_root: str) -> list[DetectionRecord]:
+def records_with_adv_images(
+    clean_records: list[DetectionRecord], adv_root: str
+) -> tuple[list[int], list[DetectionRecord], list[DetectionRecord], int]:
     adv_paths = find_adv_images(Path(adv_root).expanduser())
+    matched_indices: list[int] = []
+    matched_clean_records: list[DetectionRecord] = []
     records: list[DetectionRecord] = []
     missing = 0
-    for record in clean_records:
+    for index, record in enumerate(clean_records):
         adv_path = adv_paths.get(record.image_path.name) or adv_paths.get(record.image_path.stem)
         if adv_path is None:
             missing += 1
             continue
+        matched_indices.append(index)
+        matched_clean_records.append(record)
         records.append(DetectionRecord(adv_path, record.boxes, record.labels))
-    if missing:
-        print(f"Warning: {missing} clean images were not found in adversarial folder.")
-    return records
+    return matched_indices, matched_clean_records, records, missing
 
 
 def run_inference(model, records: list[DetectionRecord], device: torch.device, batch_size: int, max_detections: int):
@@ -205,7 +210,9 @@ def run_inference(model, records: list[DetectionRecord], device: torch.device, b
     return predictions
 
 
-def format_value(value: float) -> str:
+def format_value(value: float | None) -> str:
+    if value is None:
+        return "NA"
     return f"{value:.1f}"
 
 
@@ -243,6 +250,10 @@ def main():
 
     records = build_records(cfg, args.split)
     records = filter_records_by_classes(records, class_to_idx)
+    if args.max_samples is not None:
+        if args.max_samples <= 0:
+            raise ValueError("--max-samples must be a positive integer.")
+        records = records[: args.max_samples]
     if not records:
         raise RuntimeError("No evaluation samples found. Check --data-root and --split.")
 
@@ -252,26 +263,44 @@ def main():
     clean_metrics = evaluate_predictions(
         clean_predictions, records, class_to_idx, args.score_threshold, args.iou_threshold
     )
+    print(
+        f"Clean mAP50={clean_metrics['map50']:.2f}, "
+        f"Clean Recall={clean_metrics['recall']:.2f}, GT boxes={clean_metrics['total_gt']}"
+    )
 
     adv_metrics = None
+    attack_success = None
     if args.adv_root:
-        adv_records = records_with_adv_images(records, args.adv_root)
+        matched_indices, matched_clean_records, adv_records, missing = records_with_adv_images(records, args.adv_root)
         if not adv_records:
             raise RuntimeError("No adversarial images matched clean validation filenames.")
-        print(f"Adv samples: {len(adv_records)}")
+        if missing:
+            print(f"Warning: {missing} clean images were not found in adversarial folder.")
+        print(f"Adv samples: {len(adv_records)} matched from {len(records)} clean samples")
         adv_predictions = run_inference(model, adv_records, device, args.batch_size, args.max_detections)
         adv_metrics = evaluate_predictions(
             adv_predictions, adv_records, class_to_idx, args.score_threshold, args.iou_threshold
         )
-
-    adv_map50 = adv_metrics["map50"] if adv_metrics else 0.0
-    adv_recall = adv_metrics["recall"] if adv_metrics else 0.0
-    if adv_metrics:
-        clean_detected = clean_metrics["detected_gt"]
+        matched_clean_predictions = [clean_predictions[index] for index in matched_indices]
+        matched_clean_metrics = evaluate_predictions(
+            matched_clean_predictions,
+            matched_clean_records,
+            class_to_idx,
+            args.score_threshold,
+            args.iou_threshold,
+        )
+        clean_detected = matched_clean_metrics["detected_gt"]
         adv_detected = adv_metrics["detected_gt"]
         attack_success = len(clean_detected - adv_detected) / max(1, len(clean_detected)) * 100.0
+        print(
+            f"Adv mAP50={adv_metrics['map50']:.2f}, "
+            f"Adv Recall={adv_metrics['recall']:.2f}, ASR={attack_success:.2f}"
+        )
     else:
-        attack_success = 0.0
+        print("No --adv-root provided. Adv mAP50, Adv Recall, and ASR will be written as NA.")
+
+    adv_map50 = adv_metrics["map50"] if adv_metrics else None
+    adv_recall = adv_metrics["recall"] if adv_metrics else None
 
     row = {
         "Source Model": args.source_model,
