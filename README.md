@@ -173,6 +173,40 @@ python predict.py \
   --score-threshold 0.5
 ```
 
+## 评估 mAP50 / Recall / ASR
+
+训练完成后，可以先在干净测试集上评估：
+
+```bash
+python evaluate.py \
+  --checkpoint outputs/tt100k_fasterrcnn_bs4/best.pth \
+  --data-root /home/sutongtong/LanTu_team1/TT100K-2016 \
+  --source-model YOLOv10 \
+  --target-detector "Faster R-CNN" \
+  --output-csv outputs/metrics.csv
+```
+
+如果你有对抗样本文件夹，并且对抗图片文件名和 TT100K 测试集图片文件名一致，可以同时评估干净集和对抗集：
+
+```bash
+python evaluate.py \
+  --checkpoint outputs/tt100k_fasterrcnn_bs4/best.pth \
+  --data-root /home/sutongtong/LanTu_team1/TT100K-2016 \
+  --adv-root "/home/sutongtong/advYOLO+AdaADv4/TOGyolov9对抗样本" \
+  --source-model YOLOv10 \
+  --target-detector "Faster R-CNN" \
+  --batch-size 8 \
+  --output-csv outputs/metrics.csv
+```
+
+输出会包含：
+
+```text
+Source Model, Target Detector, Clean mAP50, Adv mAP50, Clean Recall, Adv Recall, ASR
+```
+
+其中 ASR 的计算方式是：干净图中已经成功检出的目标，在对抗图中未被成功检出的比例。
+
 ## 说明
 
 - `train.py` 保存 `last.pth` 和验证损失最小的 `best.pth`。
