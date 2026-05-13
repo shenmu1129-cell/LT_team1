@@ -198,6 +198,33 @@ dataset:
 python train.py --config configs/cctsdb.yaml
 ```
 
+也可以直接用后台脚本：
+
+```bash
+GPU_ID=2 bash scripts/train_cctsdb_bg.sh
+```
+
+默认配置：
+
+```text
+data_root=/home/sutongtong/LanTu_team1/advYOLO+AdaAD+CCTSDB/CCTSDB2021
+epochs=80
+batch_size=8
+lr=0.005
+trainable_backbone_layers=5
+min_size=1024
+max_size=1600
+eval_map_every=10
+quick_eval_samples=100
+output_dir=outputs/cctsdb_frcnn_ep80_bs8_lr005
+```
+
+查看日志：
+
+```bash
+tail -f logs/cctsdb_frcnn_ep80_bs8_lr005.log
+```
+
 如果 CCTSDB 的类别名还不确定，配置里的 `classes: null` 会自动使用标签中的数字类别，例如 `0`、`1`、`2`。如果你有类别名，建议改成：
 
 ```yaml
