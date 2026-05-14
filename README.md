@@ -146,6 +146,38 @@ tail -f logs/tt100k_frcnn_ep50_bs4_lr003.log
 kill $(cat outputs/tt100k_frcnn_ep50_bs4_lr003/train.pid)
 ```
 
+### 断点恢复训练
+
+训练每个 epoch 结束会保存：
+
+```text
+outputs/<exp_name>/last.pth
+```
+
+可以用 `--resume` 恢复完整训练状态，包括模型、optimizer、scheduler、epoch、best mAP50 和随机状态：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python train.py \
+  --data-root /home/sutongtong/LanTu_team1/TT100K-2016 \
+  --output-dir outputs/tt100k_frcnn_ep160_bs16_lr008 \
+  --resume outputs/tt100k_frcnn_ep160_bs16_lr008/last.pth \
+  --epochs 100 \
+  --batch-size 16 \
+  --lr 0.008 \
+  --lr-step-size 90 \
+  --lr-gamma 0.1 \
+  --eval-map-every 5 \
+  --quick-eval-samples 100
+```
+
+也可以用后台脚本：
+
+```bash
+GPU_ID=2 \
+OUTPUT_DIR=outputs/tt100k_frcnn_ep160_bs16_lr008 \
+bash scripts/run_resume.sh
+```
+
 如果想改数据集路径、实验名或显卡号：
 
 ```bash

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import random
 import time
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -37,6 +39,7 @@ def parse_args():
     parser.add_argument("--max-size", type=int, default=None, help="Detector input max size.")
     parser.add_argument("--eval-map-every", type=int, default=None, help="Evaluate mAP50 every N epochs.")
     parser.add_argument("--quick-eval-samples", type=int, default=None, help="Evaluate this many val samples after every epoch.")
+    parser.add_argument("--resume", default=None, help="Resume full training state from checkpoint.")
     parser.add_argument("--device", default=None, help="cuda, cpu, or leave empty for auto.")
     return parser.parse_args()
 
@@ -70,7 +73,136 @@ def apply_cli_overrides(cfg: dict, args) -> dict:
         cfg["train"]["eval_map_every"] = args.eval_map_every
     if args.quick_eval_samples is not None:
         cfg["train"]["quick_eval_samples"] = args.quick_eval_samples
+    if args.resume is not None:
+        cfg["train"]["resume"] = args.resume
     return cfg
+
+
+def get_rng_state() -> dict:
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict | None) -> None:
+    if not state:
+        print("Resume note: checkpoint has no RNG state; continuing without exact RNG restoration.")
+        return
+    try:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
+        if torch.cuda.is_available() and "cuda" in state:
+            torch.cuda.set_rng_state_all(state["cuda"])
+    except Exception as exc:
+        print(f"Resume warning: failed to restore RNG state: {exc}")
+
+
+def strip_module_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if not state_dict:
+        return state_dict
+    if all(key.startswith("module.") for key in state_dict.keys()):
+        return {key[len("module.") :]: value for key, value in state_dict.items()}
+    return state_dict
+
+
+def extract_model_state(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("model", "model_state_dict", "state_dict"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return strip_module_prefix(value)
+    if isinstance(checkpoint, dict):
+        return strip_module_prefix(checkpoint)
+    raise RuntimeError("Unsupported checkpoint format: expected a dict or state_dict.")
+
+
+def load_training_checkpoint(path: str | Path, model, optimizer, scheduler, device):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {path}")
+
+    print(f"Resuming training from: {path}")
+    checkpoint = torch.load(path, map_location=device)
+    model.load_state_dict(extract_model_state(checkpoint))
+
+    loaded_optimizer = False
+    loaded_scheduler = False
+    if isinstance(checkpoint, dict) and "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        loaded_optimizer = True
+    else:
+        print("Resume warning: checkpoint has no optimizer state; optimizer starts from current args.")
+
+    if isinstance(checkpoint, dict) and "scheduler" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        loaded_scheduler = True
+    else:
+        print("Resume warning: checkpoint has no scheduler state; scheduler starts from current args.")
+
+    if isinstance(checkpoint, dict):
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        best_val = float(checkpoint.get("best_val", float("inf")))
+        best_val_epoch = int(checkpoint.get("best_val_epoch", 0))
+        best_map50 = float(checkpoint.get("best_map50", checkpoint.get("val_map50", 0.0) or 0.0))
+        best_map50_epoch = int(checkpoint.get("best_map50_epoch", 0))
+        restore_rng_state(checkpoint.get("rng_state"))
+    else:
+        start_epoch = 0
+        best_val = float("inf")
+        best_val_epoch = 0
+        best_map50 = 0.0
+        best_map50_epoch = 0
+
+    print(
+        "Resume state: "
+        f"start_epoch={start_epoch + 1}, "
+        f"optimizer={'yes' if loaded_optimizer else 'no'}, "
+        f"scheduler={'yes' if loaded_scheduler else 'no'}, "
+        f"best_val={best_val if best_val != float('inf') else 'NA'}, "
+        f"best_val_epoch={best_val_epoch}, "
+        f"best_map50={best_map50:.2f}, "
+        f"best_map50_epoch={best_map50_epoch}"
+    )
+    print(f"Current optimizer lr after resume: {optimizer.param_groups[0]['lr']}")
+    print("AMP scaler: not used by this training script.")
+    return start_epoch, best_val, best_val_epoch, best_map50, best_map50_epoch
+
+
+def build_checkpoint(
+    epoch: int,
+    model,
+    optimizer,
+    scheduler,
+    classes: list[str],
+    cfg: dict,
+    best_val: float,
+    best_val_epoch: int,
+    best_map50: float,
+    best_map50_epoch: int,
+    val_loss: float,
+    val_map50: float | None = None,
+) -> dict:
+    return {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "classes": classes,
+        "config": cfg,
+        "best_val": best_val,
+        "best_val_epoch": best_val_epoch,
+        "best_map50": best_map50,
+        "best_map50_epoch": best_map50_epoch,
+        "val_loss": val_loss,
+        "val_map50": val_map50,
+        "rng_state": get_rng_state(),
+    }
 
 
 def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -281,20 +413,24 @@ def main():
         gamma=float(train_cfg.get("lr_gamma", 0.1)),
     )
 
+    best_val = float("inf")
+    best_val_epoch = 0
+    best_map50 = 0.0
+    best_map50_epoch = 0
     start_epoch = 0
     resume = train_cfg.get("resume")
     if resume:
-        checkpoint = torch.load(resume, map_location=device)
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        start_epoch = int(checkpoint["epoch"]) + 1
+        start_epoch, best_val, best_val_epoch, best_map50, best_map50_epoch = load_training_checkpoint(
+            resume, model, optimizer, scheduler, device
+        )
 
-    best_val = float("inf")
-    best_map50 = 0.0
     epochs = int(train_cfg.get("epochs", 20))
     print_freq = int(train_cfg.get("print_freq", 50))
     eval_map_every = int(train_cfg.get("eval_map_every", 0) or 0)
+    if start_epoch >= epochs:
+        print(f"Nothing to train: checkpoint epoch is {start_epoch}, requested epochs={epochs}.")
+        return
+
     for epoch in range(start_epoch, epochs):
         model.train()
         epoch_loss = 0.0
@@ -324,18 +460,12 @@ def main():
             f"val_loss={val_loss:.4f}, time={elapsed:.1f}s"
         )
 
-        checkpoint = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "classes": classes,
-            "config": cfg,
-        }
-        torch.save(checkpoint, output_dir / "last.pth")
+        save_best_val = False
         if val_records and val_loss < best_val:
             best_val = val_loss
-            torch.save(checkpoint, output_dir / "best.pth")
+            best_val_epoch = epoch + 1
+            save_best_val = True
+
         if quick_loader is not None:
             quick_metrics = evaluate_detection_metrics(
                 model, quick_loader, device, num_classes=len(classes) + 1, score_threshold=0.05
@@ -355,13 +485,37 @@ def main():
                     "lr": optimizer.param_groups[0]["lr"],
                 },
             )
+
+        val_map50 = None
+        save_best_map50 = False
         if val_records and eval_map_every > 0 and (epoch + 1) % eval_map_every == 0:
-            map50 = evaluate_map50(model, val_loader, device, num_classes=len(classes) + 1)
-            print(f"Epoch {epoch + 1}: val_mAP50={map50:.2f}")
-            checkpoint["val_map50"] = map50
-            if map50 > best_map50:
-                best_map50 = map50
-                torch.save(checkpoint, output_dir / "best_map50.pth")
+            val_map50 = evaluate_map50(model, val_loader, device, num_classes=len(classes) + 1)
+            print(f"Epoch {epoch + 1}: val_mAP50={val_map50:.2f}")
+            if val_map50 > best_map50:
+                best_map50 = val_map50
+                best_map50_epoch = epoch + 1
+                save_best_map50 = True
+
+        checkpoint = build_checkpoint(
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            classes=classes,
+            cfg=cfg,
+            best_val=best_val,
+            best_val_epoch=best_val_epoch,
+            best_map50=best_map50,
+            best_map50_epoch=best_map50_epoch,
+            val_loss=val_loss,
+            val_map50=val_map50,
+        )
+        torch.save(checkpoint, output_dir / "last.pth")
+        if save_best_val:
+            torch.save(checkpoint, output_dir / "best.pth")
+        if save_best_map50:
+            torch.save(checkpoint, output_dir / "best_map50.pth")
+            print(f"New best mAP50: {best_map50:.2f} at epoch {best_map50_epoch}")
 
     print(f"Done. Checkpoints saved to: {output_dir}")
 
