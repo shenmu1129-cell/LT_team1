@@ -122,13 +122,20 @@ def extract_model_state(checkpoint):
     raise RuntimeError("Unsupported checkpoint format: expected a dict or state_dict.")
 
 
+def load_checkpoint(path: str | Path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
 def load_training_checkpoint(path: str | Path, model, optimizer, scheduler, device):
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Resume checkpoint not found: {path}")
 
     print(f"Resuming training from: {path}")
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = load_checkpoint(path, device)
     model.load_state_dict(extract_model_state(checkpoint))
 
     loaded_optimizer = False
@@ -185,7 +192,7 @@ def recover_best_metrics_from_existing_files(
     best_loss_path = output_dir / "best.pth"
     if best_val == float("inf") and best_loss_path.exists():
         try:
-            best_checkpoint = torch.load(best_loss_path, map_location=device)
+            best_checkpoint = load_checkpoint(best_loss_path, device)
             recovered_val = best_checkpoint.get("best_val", best_checkpoint.get("val_loss"))
             if recovered_val is not None:
                 best_val = float(recovered_val)
@@ -197,7 +204,7 @@ def recover_best_metrics_from_existing_files(
     best_map_path = output_dir / "best_map50.pth"
     if best_map50 <= 0.0 and best_map_path.exists():
         try:
-            best_checkpoint = torch.load(best_map_path, map_location=device)
+            best_checkpoint = load_checkpoint(best_map_path, device)
             recovered_map = best_checkpoint.get("best_map50", best_checkpoint.get("val_map50"))
             if recovered_map is not None:
                 best_map50 = float(recovered_map)

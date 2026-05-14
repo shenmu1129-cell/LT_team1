@@ -155,8 +155,15 @@ def load_classes(checkpoint: dict, classes_path: str | None) -> list[str]:
     raise RuntimeError("No class metadata found. Pass --classes outputs/.../classes.json.")
 
 
+def load_checkpoint(path: str | Path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
 def load_model(checkpoint_path: str, classes: list[str], device: torch.device):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = load_checkpoint(checkpoint_path, device)
     cfg = checkpoint["config"]
     model = build_faster_rcnn(num_classes=len(classes) + 1, cfg=cfg)
     model.load_state_dict(checkpoint["model"])
@@ -253,7 +260,7 @@ def save_csv(row: dict[str, str], output_csv: str) -> None:
 def main():
     args = parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = load_checkpoint(args.checkpoint, device)
     classes = load_classes(checkpoint, args.classes)
     model, _ = load_model(args.checkpoint, classes, device)
 

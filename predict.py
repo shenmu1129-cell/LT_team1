@@ -22,13 +22,20 @@ def parse_args():
     return parser.parse_args()
 
 
+def load_checkpoint(path: str | Path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     meta = load_json(args.classes)
     classes = meta["classes"]
 
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = load_checkpoint(args.checkpoint, device)
     cfg = checkpoint["config"]
     model = build_faster_rcnn(num_classes=len(classes) + 1, cfg=cfg)
     model.load_state_dict(checkpoint["model"])
