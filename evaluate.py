@@ -23,6 +23,8 @@ def parse_args():
     parser.add_argument("--data-root", default=None, help="Clean dataset root.")
     parser.add_argument("--split", default="val", choices=["train", "val"], help="Clean split to evaluate.")
     parser.add_argument("--adv-root", default=None, help="Adversarial image folder. Uses clean GT labels.")
+    parser.add_argument("--adv-suffix", default="", help="Suffix added to clean image stems, e.g. _adv.")
+    parser.add_argument("--adv-prefix", default="", help="Prefix added to clean image stems.")
     parser.add_argument("--source-model", default="YOLOv10", help="Source model name for table.")
     parser.add_argument("--target-detector", default="Faster R-CNN", help="Target detector name for table.")
     parser.add_argument("--score-threshold", type=float, default=0.05, help="Score threshold for recall/ASR.")
@@ -171,7 +173,7 @@ def find_adv_images(adv_root: Path) -> dict[str, Path]:
 
 
 def records_with_adv_images(
-    clean_records: list[DetectionRecord], adv_root: str
+    clean_records: list[DetectionRecord], adv_root: str, adv_prefix: str = "", adv_suffix: str = ""
 ) -> tuple[list[int], list[DetectionRecord], list[DetectionRecord], int]:
     adv_paths = find_adv_images(Path(adv_root).expanduser())
     matched_indices: list[int] = []
@@ -179,7 +181,19 @@ def records_with_adv_images(
     records: list[DetectionRecord] = []
     missing = 0
     for index, record in enumerate(clean_records):
-        adv_path = adv_paths.get(record.image_path.name) or adv_paths.get(record.image_path.stem)
+        clean_stem = record.image_path.stem
+        clean_name = record.image_path.name
+        adv_stem = f"{adv_prefix}{clean_stem}{adv_suffix}"
+        candidates = [
+            clean_name,
+            clean_stem,
+            adv_stem,
+        ]
+        adv_path = None
+        for key in candidates:
+            adv_path = adv_paths.get(key)
+            if adv_path is not None:
+                break
         if adv_path is None:
             missing += 1
             continue
@@ -271,7 +285,12 @@ def main():
     adv_metrics = None
     attack_success = None
     if args.adv_root:
-        matched_indices, matched_clean_records, adv_records, missing = records_with_adv_images(records, args.adv_root)
+        matched_indices, matched_clean_records, adv_records, missing = records_with_adv_images(
+            records,
+            args.adv_root,
+            adv_prefix=args.adv_prefix,
+            adv_suffix=args.adv_suffix,
+        )
         if not adv_records:
             raise RuntimeError("No adversarial images matched clean validation filenames.")
         if missing:
