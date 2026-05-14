@@ -174,6 +174,43 @@ def load_training_checkpoint(path: str | Path, model, optimizer, scheduler, devi
     return start_epoch, best_val, best_val_epoch, best_map50, best_map50_epoch
 
 
+def recover_best_metrics_from_existing_files(
+    output_dir: Path,
+    best_val: float,
+    best_val_epoch: int,
+    best_map50: float,
+    best_map50_epoch: int,
+    device,
+) -> tuple[float, int, float, int]:
+    best_loss_path = output_dir / "best.pth"
+    if best_val == float("inf") and best_loss_path.exists():
+        try:
+            best_checkpoint = torch.load(best_loss_path, map_location=device)
+            recovered_val = best_checkpoint.get("best_val", best_checkpoint.get("val_loss"))
+            if recovered_val is not None:
+                best_val = float(recovered_val)
+                best_val_epoch = int(best_checkpoint.get("best_val_epoch", best_checkpoint.get("epoch", -1) + 1))
+                print(f"Recovered best_val={best_val:.4f} from {best_loss_path} at epoch {best_val_epoch}.")
+        except Exception as exc:
+            print(f"Resume warning: failed to recover best_val from {best_loss_path}: {exc}")
+
+    best_map_path = output_dir / "best_map50.pth"
+    if best_map50 <= 0.0 and best_map_path.exists():
+        try:
+            best_checkpoint = torch.load(best_map_path, map_location=device)
+            recovered_map = best_checkpoint.get("best_map50", best_checkpoint.get("val_map50"))
+            if recovered_map is not None:
+                best_map50 = float(recovered_map)
+                best_map50_epoch = int(
+                    best_checkpoint.get("best_map50_epoch", best_checkpoint.get("epoch", -1) + 1)
+                )
+                print(f"Recovered best_map50={best_map50:.2f} from {best_map_path} at epoch {best_map50_epoch}.")
+        except Exception as exc:
+            print(f"Resume warning: failed to recover best_map50 from {best_map_path}: {exc}")
+
+    return best_val, best_val_epoch, best_map50, best_map50_epoch
+
+
 def build_checkpoint(
     epoch: int,
     model,
@@ -422,6 +459,14 @@ def main():
     if resume:
         start_epoch, best_val, best_val_epoch, best_map50, best_map50_epoch = load_training_checkpoint(
             resume, model, optimizer, scheduler, device
+        )
+        best_val, best_val_epoch, best_map50, best_map50_epoch = recover_best_metrics_from_existing_files(
+            output_dir,
+            best_val,
+            best_val_epoch,
+            best_map50,
+            best_map50_epoch,
+            device,
         )
 
     epochs = int(train_cfg.get("epochs", 20))
