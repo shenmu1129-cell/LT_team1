@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument("--eval-map-every", type=int, default=None, help="Evaluate mAP50 every N epochs.")
     parser.add_argument("--quick-eval-samples", type=int, default=None, help="Evaluate this many val samples after every epoch.")
     parser.add_argument("--resume", default=None, help="Resume full training state from checkpoint.")
+    parser.add_argument("--resume-lr", type=float, default=None, help="Override optimizer lr after loading --resume.")
     parser.add_argument("--device", default=None, help="cuda, cpu, or leave empty for auto.")
     return parser.parse_args()
 
@@ -75,6 +76,8 @@ def apply_cli_overrides(cfg: dict, args) -> dict:
         cfg["train"]["quick_eval_samples"] = args.quick_eval_samples
     if args.resume is not None:
         cfg["train"]["resume"] = args.resume
+    if args.resume_lr is not None:
+        cfg["train"]["resume_lr"] = args.resume_lr
     return cfg
 
 
@@ -179,6 +182,14 @@ def load_training_checkpoint(path: str | Path, model, optimizer, scheduler, devi
     print(f"Current optimizer lr after resume: {optimizer.param_groups[0]['lr']}")
     print("AMP scaler: not used by this training script.")
     return start_epoch, best_val, best_val_epoch, best_map50, best_map50_epoch
+
+
+def override_optimizer_lr(optimizer, scheduler, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    if hasattr(scheduler, "base_lrs"):
+        scheduler.base_lrs = [lr for _ in scheduler.base_lrs]
+    print(f"Resume lr override: optimizer lr set to {lr}")
 
 
 def recover_best_metrics_from_existing_files(
@@ -467,6 +478,8 @@ def main():
         start_epoch, best_val, best_val_epoch, best_map50, best_map50_epoch = load_training_checkpoint(
             resume, model, optimizer, scheduler, device
         )
+        if train_cfg.get("resume_lr") is not None:
+            override_optimizer_lr(optimizer, scheduler, float(train_cfg["resume_lr"]))
         best_val, best_val_epoch, best_map50, best_map50_epoch = recover_best_metrics_from_existing_files(
             output_dir,
             best_val,
